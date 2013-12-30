@@ -9,6 +9,7 @@
 #import "JFHttpConnection.h"
 #import "JFHttpServer.h"
 #import "JFHttpRequest.h"
+#import "JFHttpReply.h"
 #import "NSString+BufferAndLength.h"
 #include "http11_parser.h"
 
@@ -30,16 +31,28 @@ static void header_done_cb(void *data, const char *at, size_t length);
 {
     http_parser _parser;
     int _socket;
-    dispatch_source_t _readSource;
 
     char _readBuffer[BUFFER_SIZE];
     size_t _numParsed;
+
+    BOOL _shouldClose;
 }
 
+@property (strong, nonatomic) dispatch_source_t readSource;
+@property (strong, nonatomic) dispatch_source_t writeSource;
+
 @property (strong, nonatomic) JFHttpRequest *currentRequest;
+@property (copy  , nonatomic) NSString *currentResponse;
+@property (assign, atomic) NSUInteger socketReferenceCount;
 
 - (void)startWithSocket:(int)s;
-- (void)handleRead;
+- (void)readEvent;
+- (void)readCancel;
+- (void)writeEvent;
+- (void)writeCancel;
+
+- (void)addSocketRef;
+- (void)decSocketRef;
 
 @end
 
@@ -59,13 +72,16 @@ static void header_done_cb(void *data, const char *at, size_t length);
         _parser.query_string = query_string_cb;
         _parser.http_version = http_version_cb;
         _parser.header_done = header_done_cb;
+
+        _shouldClose = NO;
     }
     return self;
 }
 
 - (void)dealloc
 {
-
+    self.currentRequest = nil;
+    self.currentResponse = nil;
 }
 
 - (void)startWithSocket:(int)s
@@ -74,8 +90,8 @@ static void header_done_cb(void *data, const char *at, size_t length);
     fcntl(_socket, F_SETFL, O_NONBLOCK);
 
     dispatch_queue_t globalQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
-    _readSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, _socket, 0, globalQueue);
-    if (_readSource == NULL) {
+    self.readSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, _socket, 0, globalQueue);
+    if (self.readSource == NULL) {
         NSLog(@"JFHttpConnection -startWithSocket: Failed to create a dispatch source for socket %d", _socket);
         close(_socket);
         _socket = -1;
@@ -83,21 +99,22 @@ static void header_done_cb(void *data, const char *at, size_t length);
         return;
     }
 
-    dispatch_source_set_event_handler(_readSource, ^{
-        [self handleRead];
+    dispatch_source_set_event_handler(self.readSource, ^{
+        [self readEvent];
     });
 
-    dispatch_source_set_cancel_handler(_readSource, ^{
-        close(_socket);
-        _readSource = NULL;
-        [self.server removeConnection:self];
+    dispatch_source_set_cancel_handler(self.readSource, ^{
+        [self readCancel];
     });
 
-    dispatch_resume(_readSource);
+    [self addSocketRef];
+    dispatch_resume(self.readSource);
 }
 
-- (void)handleRead
+- (void)readEvent;
 {
+    NSLog(@"JFHttpConnection - read event handler");
+
     // Just starting a new request?
     if (_currentRequest == nil) {
         _currentRequest = [[JFHttpRequest alloc] init];
@@ -105,31 +122,105 @@ static void header_done_cb(void *data, const char *at, size_t length);
         _parser.data = (__bridge void *)(_currentRequest);
     }
 
-    size_t estimated = dispatch_source_get_data(_readSource) + 1;
+    size_t estimated = dispatch_source_get_data(self.readSource) + 1;
     size_t actual = read(_socket, _readBuffer, estimated);
+    if (actual == -1) {
+        NSLog(@"JFHttpConnection - read() failed, bailing out");
+        dispatch_source_cancel(self.readSource);
+        self.readSource = nil;
+    }
     _numParsed = http_parser_execute(&_parser, _readBuffer, actual, _numParsed);
 
     int finished = http_parser_finish(&_parser);
     if (finished) {
-        // Done with this request.
-        NSLog(@"Finished reading a request.");
-        NSLog(@"Host: %@", _currentRequest.host);
-        NSLog(@"Method: %@", _currentRequest.method);
-        NSLog(@"Version: %@", _currentRequest.httpVersion);
-        NSLog(@"URI: %@", _currentRequest.uri);
-        NSLog(@"Path: %@", _currentRequest.path);
-        NSLog(@"Query string: %@", _currentRequest.queryString);
-        NSLog(@"Fragment: %@", _currentRequest.fragment);
-        NSLog(@"Content length: %ld", (long)_currentRequest.contentLength);
+        // TODO: Figure out the proper logic for whether or not a connection should be closed.
+        _shouldClose = YES;
+//        NSString *closeHeader = [_currentRequest valueForHeader:@"connection"];
+//        if (closeHeader != nil && [closeHeader caseInsensitiveCompare:@"close"] == NSOrderedSame) {
+//            _shouldClose = YES;
+//        }
 
-        NSLog(@"Headers:");
-        NSDictionary *allHeaders = _currentRequest.allHeaders;
-        for (NSString *key in allHeaders) {
-            NSLog(@"  %@: %@", key, allHeaders[key]);
+        JFHttpReply *reply = [[JFHttpReply alloc] init];
+        reply.statusCode = HTTPStatusNotFound;
+        reply.contentType = nil;
+        [reply setHeaderField:@"Connection" value:@"close"];
+        self.currentResponse = [reply response];
+        
+        dispatch_queue_t globalQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+        self.writeSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_WRITE, _socket, 0, globalQueue);
+        [self addSocketRef];
+        if (self.writeSource == nil) {
+            NSLog(@"JFHttpConnection -handleRead: Failed to create a dispatch source to write a response to socket %d", _socket);
+
+            dispatch_source_cancel(self.readSource);
+            self.readSource = nil;
+
+            close(_socket);
+            _socket = -1;
+
+            [self.server removeConnection:self];
+            return;
         }
 
+        dispatch_source_set_event_handler(self.writeSource, ^{
+            [self writeEvent];
+        });
 
-        _currentRequest = nil;
+        dispatch_source_set_cancel_handler(self.writeSource, ^{
+            [self writeCancel];
+        });
+
+        dispatch_resume(self.writeSource);
+
+        if (_shouldClose) {
+            NSLog(@"JFHttpConnection - cancelling the read handler");
+            dispatch_source_cancel(self.readSource);
+            self.readSource = nil;
+        }
+    }
+}
+
+- (void)readCancel
+{
+    NSLog(@"JFHttpConnection - read cancel handler");
+    [self decSocketRef];
+}
+
+- (void)writeEvent
+{
+    NSLog(@"JFHttpConnection - write event handler");
+    const char *writeBuffer = [self.currentResponse cStringUsingEncoding:NSUTF8StringEncoding];
+    const size_t len = strlen(writeBuffer) + 1;
+
+    write(_socket, writeBuffer, len);
+
+    dispatch_source_cancel(self.writeSource);
+    self.writeSource = nil;
+}
+
+- (void)writeCancel
+{
+    NSLog(@"JFHttpConnection - write cancel handler");
+    self.currentResponse = nil;
+    self.currentRequest = nil;
+    [self decSocketRef];
+}
+
+- (void)addSocketRef
+{
+    self.socketReferenceCount = self.socketReferenceCount + 1;
+     NSLog(@"JFHttpConnection -addSocketRef - Socket reference count is now %lu.", self.socketReferenceCount);
+}
+
+- (void)decSocketRef
+{
+    self.socketReferenceCount = self.socketReferenceCount - 1;
+
+    NSLog(@"JFHttpConnection -decSocketRef - Socket reference count is now %lu.", self.socketReferenceCount);
+    if (self.socketReferenceCount == 0) {
+        NSLog(@"JFHttpConnection - closing socket %d", _socket);
+        close(_socket);
+        _socket = -1;
     }
 }
 

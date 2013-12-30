@@ -160,10 +160,10 @@
 				ABA642DB1869F5F7003D3D62 /* JFHttpRequestHandler.m */,
 				ABA6429E1869F569003D3D62 /* JFHttpServer.h */,
 				ABA6429F1869F569003D3D62 /* JFHttpServer.m */,
+				AB8CE46918713C3B00A877A6 /* JFHttpStatusCodes.h */,
 				ABA642E4186A0D26003D3D62 /* NSString+BufferAndLength.h */,
 				ABA642E5186A0D26003D3D62 /* NSString+BufferAndLength.m */,
 				ABA642981869F568003D3D62 /* Supporting Files */,
-				AB8CE46918713C3B00A877A6 /* JFHttpStatusCodes.h */,
 			);
 			path = JFHttpServer;
 			sourceTree = "<group>";

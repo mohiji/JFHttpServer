@@ -7,28 +7,17 @@
 //
 
 #import <Foundation/Foundation.h>
-#import "JFHttpBuffer.h"
-
-#define kHTTPStatusContinue           (100)
-#define kHTTPStatusSwitchingProtocols (101)
-#define kHTTPStatusProcessing         (102)
-
-#define kHTTPStatusOk                 (200)
-#define kHTTPStatusCreated            (201)
-#define kHTTPStatusAccepted           (202)
-#define kHTTPStatusNonAuthoritative   (203)
-#define kHTTPStatusNoContent          (204)
-#define kHTTPStatusResetContent       (205)
-#define kHTTPStatusPartialContent     (206)
-#define kHTTPStatusMultiStatus        (207)
-
-#define kHTTPStatusNotFound           (404)
+#import "JFHttpStatusCodes.h"
 
 @interface JFHttpReply : NSObject
 
-@property (assign, nonatomic) NSUInteger statusCode;
+@property (copy  , nonatomic) NSString *content;
+@property (copy  , nonatomic) NSData *data;
+
+@property (assign, nonatomic) HTTPStatus statusCode;
+@property (copy  , nonatomic) NSString *contentType;
 
 - (void)setHeaderField:(NSString*)field value:(NSString*)value;
-- (void)fillBuffer:(JFHttpBuffer*)buffer;
+- (NSString*)response;
 
 @end
